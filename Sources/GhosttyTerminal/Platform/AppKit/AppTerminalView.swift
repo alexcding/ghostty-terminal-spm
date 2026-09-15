@@ -22,6 +22,7 @@
         var keyEcho: KeyEchoState = .init()
         var pointer: PointerSelectionState = .init()
         var focusBridge: FocusBridgeState = .init()
+        var colorSchemeUpdateScheduled = false
 
         open weak var delegate: (any TerminalSurfaceViewDelegate)? {
             get { core.delegate }

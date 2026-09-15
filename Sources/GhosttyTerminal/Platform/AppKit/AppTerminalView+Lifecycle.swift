@@ -224,6 +224,25 @@
         }
 
         func updateColorScheme() {
+            // AppKit can invoke appearance changes from setContentView or
+            // SwiftUI representable attachment. Reconfiguring TerminalViewState
+            // publishes, so perform the entire change after that update pass.
+            // Coalesce and read current ownership/appearance at execution time.
+            guard !colorSchemeUpdateScheduled else { return }
+            colorSchemeUpdateScheduled = true
+            terminalRunOnMainNextTurn { [weak self] in
+                guard let self else { return }
+                colorSchemeUpdateScheduled = false
+                guard window != nil else { return }
+                if let state = delegate as? TerminalViewState,
+                   let attached = state.attachedPlatformView, attached !== self {
+                    return
+                }
+                applyCurrentColorScheme()
+            }
+        }
+
+        private func applyCurrentColorScheme() {
             let scheme: TerminalColorScheme = switch effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) {
             case .darkAqua: .dark
             default: .light

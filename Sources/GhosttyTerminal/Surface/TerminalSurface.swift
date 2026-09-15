@@ -26,6 +26,14 @@ public final class TerminalSurface {
         surface
     }
 
+    /// Actual native render-frame submissions since this surface was created.
+    /// Includes native-thread draws; reading does not refresh or draw.
+    /// This is not a GPU completion count or a display timestamp.
+    public var submittedFrameCount: UInt64? {
+        guard let surface else { return nil }
+        return ghostty_surface_submitted_frame_count(surface)
+    }
+
     // MARK: - Input
 
     @discardableResult
