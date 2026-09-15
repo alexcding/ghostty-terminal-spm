@@ -1,0 +1,153 @@
+--- a/src/termio/Termio.zig
++++ b/src/termio/Termio.zig
+@@ -73,6 +73,7 @@
+ snapshot_metadata_pending: bool = false,
+ host_snapshot_geometry: bool = false,
+ host_geometry_callback: ?HostGeometryCallback = null,
++host_appearance_callback: ?HostAppearanceCallback = null,
+ 
+ /// Last time the cursor was reset. This is used to prevent message
+ /// flooding with cursor resets.
+@@ -503,6 +504,7 @@
+         32 * 1024 * 1024 else config.image_storage_limit);
+     self.terminal.setKittyGraphicsLoadingLimits(if (self.host_ordered_grid)
+         .direct else .allWithTempDir(global.tmpDirPath()));
++    self.notifyHostAppearance();
+ }
+ 
+ /// Resize the terminal.
+@@ -553,6 +555,64 @@
+ /// Register a complete geometry callback. It runs under the renderer mutex;
+ /// the host must enqueue work without re-entering the surface. Existing resize
+ /// callbacks remain unchanged for clients that only consume the grid.
++pub const HostAppearanceCallback = *const fn (?*anyopaque, [*]const u32, usize) callconv(.c) void;
++
++pub fn setHostAppearanceCallback(self: *Termio, callback: HostAppearanceCallback) !void {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (self.backend != .host_managed or self.config.osc_color_report_format != .@"16-bit")
++        return error.IncompatibleAppearancePolicy;
++    self.host_appearance_callback = callback;
++    self.notifyHostAppearance();
++}
++
++fn encodeHostRGB(value: ?terminalpkg.color.RGB) u32 {
++    const c = value orelse return std.math.maxInt(u32);
++    return (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
++}
++fn decodeHostRGB(value: u32) ?terminalpkg.color.RGB {
++    if (value == std.math.maxInt(u32)) return null;
++    return .{ .r = @truncate(value >> 16), .g = @truncate(value >> 8), .b = @truncate(value) };
++}
++fn notifyHostAppearance(self: *Termio) void {
++    const callback = self.host_appearance_callback orelse return;
++    if (self.backend != .host_managed) return;
++    var values: [260]u32 = undefined;
++    for (self.config.palette, 0..) |c, i| values[i] = encodeHostRGB(c);
++    values[256] = encodeHostRGB(self.config.foreground.toTerminalRGB());
++    values[257] = encodeHostRGB(self.config.background.toTerminalRGB());
++    values[258] = encodeHostRGB(if (self.config.cursor_color) |c| c.toTerminalRGB() else null);
++    values[259] = switch (self.config.conditional_state.theme) { .light => 0, .dark => 1 };
++    // Borrowed stack bytes: the host copies/enqueues them without re-entering us.
++    callback(self.backend.host_managed.userdata, &values, values.len);
++}
++
++pub fn enableHostAppearanceResponses(self: *Termio) !void {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (!self.host_ordered_grid or !self.snapshot_metadata_pending or
++        !self.terminal_stream.handler.host_geometry_responses or
++        self.config.osc_color_report_format != .@"16-bit") return error.IncompatibleAppearancePolicy;
++    self.terminal_stream.handler.host_appearance_responses = true;
++}
++
++pub fn applyHostAppearance(self: *Termio, values: []const u32) !void {
++    if (values.len != 260 or values[259] > 1) return error.InvalidAppearance;
++    for (values[0..258]) |value| if (value > 0xffffff) return error.InvalidAppearance;
++    if (values[258] > 0xffffff and values[258] != std.math.maxInt(u32)) return error.InvalidAppearance;
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (!self.host_ordered_grid or self.backend != .host_managed) return error.NotHostManaged;
++    var palette: terminalpkg.color.Palette = undefined;
++    for (&palette, values[0..256]) |*c, value| c.* = decodeHostRGB(value).?;
++    try self.terminal.colors.palette.changeDefault(self.alloc, palette);
++    self.terminal.colors.foreground.default = decodeHostRGB(values[256]);
++    self.terminal.colors.background.default = decodeHostRGB(values[257]);
++    self.terminal.colors.cursor.default = decodeHostRGB(values[258]);
++    self.terminal.flags.dirty.palette = true;
++    self.renderer_wakeup.notify() catch {};
++}
++
+ pub const HostGeometryCallback = *const fn (?*anyopaque, u16, u16, u32, u32, u32, u32) callconv(.c) void;
+ 
+ pub fn setHostGeometryCallback(self: *Termio, callback: HostGeometryCallback) !void {
+@@ -988,6 +1048,7 @@
+ }
+ 
+ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
++    if (self.terminal_stream.handler.host_appearance_responses) return;
+     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
+         return;
+     }
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -99,6 +99,7 @@
+     host_state_responses: bool = false,
+     host_identity_responses: bool = false,
+     host_geometry_responses: bool = false,
++    host_appearance_responses: bool = false,
+ 
+     /// This is set to true when we've seen a title escape sequence. We use
+     /// this to determine if we need to default the window title.
+@@ -1746,7 +1747,7 @@
+                 ),
+ 
+                 .query => |kind| report: {
+-                    if (self.osc_color_report_format == .none) break :report;
++                    if (self.host_appearance_responses or self.osc_color_report_format == .none) break :report;
+ 
+                     const color = switch (kind) {
+                         .palette => |i| self.terminal.colors.palette.current[i],
+@@ -1869,6 +1870,7 @@
+         for (request.list.items) |item| {
+             switch (item) {
+                 .query => |key| {
++                    if (self.host_appearance_responses) continue;
+                     // If the writer buffer is empty, we need to write our prefix
+                     if (stream.written().len == 0) try writer.writeAll("\x1b]21");
+ 
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1972,6 +1972,19 @@
+         return true;
+     }
+ 
++    export fn ghostty_surface_set_host_appearance_callback(surface: *Surface, callback: termio.Termio.HostAppearanceCallback) bool {
++        surface.core_surface.io.setHostAppearanceCallback(callback) catch return false;
++        return true;
++    }
++    export fn ghostty_surface_enable_host_appearance_responses(surface: *Surface) bool {
++        surface.core_surface.io.enableHostAppearanceResponses() catch return false;
++        return true;
++    }
++    export fn ghostty_surface_apply_host_appearance(surface: *Surface, values: [*]const u32, len: usize) bool {
++        surface.core_surface.io.applyHostAppearance(values[0..len]) catch return false;
++        return true;
++    }
++
+     /// Adds pixel geometry ownership on a fresh snapshot with complete metrics.
+     export fn ghostty_surface_enable_host_geometry_responses(surface: *Surface) bool {
+         surface.core_surface.io.enableHostStateResponses(true, true) catch return false;
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1199,6 +1199,10 @@
+ GHOSTTY_API bool ghostty_surface_enable_host_state_responses(ghostty_surface_t);
+ bool ghostty_surface_enable_host_identity_responses(ghostty_surface_t);
+ GHOSTTY_API bool ghostty_surface_enable_host_geometry_responses(ghostty_surface_t);
++typedef void (*ghostty_surface_host_appearance_cb)(void*, const uint32_t*, size_t);
++GHOSTTY_API bool ghostty_surface_set_host_appearance_callback(ghostty_surface_t, ghostty_surface_host_appearance_cb);
++GHOSTTY_API bool ghostty_surface_enable_host_appearance_responses(ghostty_surface_t);
++GHOSTTY_API bool ghostty_surface_apply_host_appearance(ghostty_surface_t, const uint32_t*, size_t);
+ typedef void (*ghostty_surface_host_geometry_cb)(void*, uint16_t, uint16_t, uint32_t, uint32_t, uint32_t, uint32_t);
+ GHOSTTY_API bool ghostty_surface_set_host_geometry_callback(ghostty_surface_t, ghostty_surface_host_geometry_cb);
+ bool ghostty_surface_publish_snapshot_metadata(ghostty_surface_t);

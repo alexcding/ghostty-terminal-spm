@@ -1,0 +1,33 @@
+--- a/src/terminal/stream.zig
++++ b/src/terminal/stream.zig
+@@ -1897,6 +1897,11 @@
+ 
+                 // c - Device Attributes (DA1)
+                 'c' => {
++                    // DA requests take zero or one parameter, whose value must
++                    // be zero. A DA2 response has three parameters; accepting it
++                    // as a request creates a feedback loop when input is echoed.
++                    if (input.params.len > 1 or
++                        (input.params.len == 1 and input.params[0] != 0)) return;
+                     const req: ?device_attributes.Req = switch (input.intermediates.len) {
+                         0 => .primary,
+                         1 => switch (input.intermediates[0]) {
+@@ -2167,7 +2172,7 @@
+ 
+                 // DECRQM - Request Mode
+                 'p' => switch (input.intermediates.len) {
+-                    2 => decrqm: {
++                    1, 2 => decrqm: {
+                         const ansi_mode = ansi: {
+                             switch (input.intermediates.len) {
+                                 1 => if (input.intermediates[0] == '$') break :ansi true,
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -1604,6 +1604,7 @@
+             // the dimensions they need for their first image frame.
+             .in_band_size_reports => if (enabled) self.reportMode2048(),
+ 
++            .report_color_scheme => if (enabled) self.deviceStatus(.color_scheme),
+             .report_visibility => if (enabled) self.sendVisibilityReport(),
+ 
+             .mouse_event_x10 => {

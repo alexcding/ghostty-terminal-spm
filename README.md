@@ -1,3 +1,22 @@
+# GhosttyTerminal for TaskHub
+
+TaskHub's fork of [libghostty-spm](https://github.com/Lakr233/libghostty-spm) (MIT, by
+@Lakr233) pinned at release 1.6.20260909, with the patches TaskHub's native terminal
+needs applied to the Swift wrapper (`Sources/`) and, at build time, to Ghostty itself
+(`TaskHub/patches/`). Ghostty is MIT licensed too (`LICENSE-ghostty`).
+
+The binary target is prebuilt: `Package.swift` points at the `GhosttyKit.xcframework.zip`
+attached to the GitHub release matching the tag, so consumers need neither Zig nor the
+Metal Toolchain. Each release also carries `ghostty-vt-runtime.zip`, the headless
+libghostty-vt runtime that TaskHub's PTY helper links. Apple Silicon macOS only.
+
+Releasing: push a `<ghostty version>-taskhub.<n>` tag, let
+`.github/workflows/release.yml` build and attach the artifacts, then point
+`Package.swift` at the new tag with the checksum the job prints, and commit.
+`Script/taskhub-release.sh` is the same build, runnable locally.
+
+---
+
 # GhosttyKit
 
 Swift Package wrapping [Ghostty](https://ghostty.org)'s terminal emulator library for Apple platforms.

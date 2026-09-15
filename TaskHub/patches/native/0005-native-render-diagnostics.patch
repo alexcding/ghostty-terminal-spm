@@ -1,0 +1,50 @@
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1207,6 +1207,8 @@
+ GHOSTTY_API void ghostty_surface_process_exit(ghostty_surface_t, uint32_t, uint64_t);
+ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
++// TaskHub: cumulative submitted render frames for this live surface, not display timestamps.
++GHOSTTY_API uint64_t ghostty_surface_submitted_frame_count(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -2106,6 +2106,11 @@
+ 
++    /// Read-only diagnostic. The caller must keep the surface alive.
++    export fn ghostty_surface_submitted_frame_count(surface: *Surface) u64 {
++        return surface.core_surface.renderer.submitted_frame_count.load(.monotonic);
++    }
++
+     /// Tell the surface that it needs to schedule a render
+     /// call as soon as possible (NOW if possible).
+     export fn ghostty_surface_draw(surface: *Surface) void {
+         surface.draw();
+     }
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -101,6 +101,10 @@
+         /// This mutex must be held whenever any state used in `drawFrame` is
+         /// being modified, and also when it's being accessed in `drawFrame`.
+         draw_mutex: std.Io.Mutex = .init,
++
++        /// TaskHub diagnostic: actual frame submissions, including native-thread
++        /// draws. Atomic reads do not acquire render locks or schedule work.
++        submitted_frame_count: std.atomic.Value(u64) = .init(0),
+ 
+         /// The configuration we need derived from the main config.
+         config: DerivedConfig,
+@@ -1784,7 +1788,10 @@
+ 
+             // Get a frame context from the graphics API.
+             var frame_ctx = try self.api.beginFrame(self, &frame.target);
+-            defer frame_ctx.complete(sync);
++            defer {
++                frame_ctx.complete(sync);
++                _ = self.submitted_frame_count.fetchAdd(1, .monotonic);
++            }
+ 
+             {
+                 var pass = frame_ctx.renderPass(&.{.{
