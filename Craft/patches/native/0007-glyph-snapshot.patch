@@ -1,0 +1,184 @@
+--- a/src/terminal/apc/glyph/Glossary.zig
++++ b/src/terminal/apc/glyph/Glossary.zig
+@@ -129,6 +129,9 @@
+     /// These are stored as raw outlines; rasterization is delayed to
+     /// renderers. The outlines have been validated.
+     glyph: Glyph,
++
++    /// Validated registration retained for lossless snapshot reconstruction.
++    registration: []const u8 = &.{},
+ 
+     /// Authored metrics for the glyph's design coordinate space.
+     design: DesignMetrics,
+@@ -179,11 +182,15 @@
+             .colrv0, .colrv1 => return error.UnsupportedFormat,
+         };
+ 
+-        // No more errors, since we never do glyph cleanup above.
+-        errdefer comptime unreachable;
++        const registration = alloc.dupe(u8, req.raw) catch |err| {
++            var owned = glyph;
++            switch (owned) { .glyf => |*outline| outline.deinit(alloc) }
++            return err;
++        };
+ 
+         return .{
+             .glyph = glyph,
++            .registration = registration,
+             .design = design,
+             .width = width,
+             .constraint = constraint,
+@@ -192,6 +199,7 @@
+ 
+     /// Release memory owned by this entry.
+     pub fn deinit(self: *Entry, alloc: Allocator) void {
++        alloc.free(self.registration);
+         switch (self.glyph) {
+             .glyf => |*outline| outline.deinit(alloc),
+         }
+--- a/src/terminal/snapshot/envelope.zig
++++ b/src/terminal/snapshot/envelope.zig
+@@ -26,7 +26,7 @@
+ 
+ /// The complete compatibility boundary for snapshot layout and behavior.
+ /// Version 1 readers require this value to match exactly.
+-pub const version: u16 = 1;
++pub const version: u16 = 2; // Craft extension, negotiated as craft-glyph-v2.
+ 
+ /// Number of bytes in the fixed envelope: magic followed by version.
+ pub const encoded_len = computeLen();
+--- a/src/terminal/snapshot/record.zig
++++ b/src/terminal/snapshot/record.zig
+@@ -52,6 +52,9 @@
+ 
+     /// Canonical unfinished standard TerminalStream input.
+     continuation = 7,
++
++    /// Craft: validated glyph registrations in FIFO order.
++    glyphs = 8,
+ };
+ 
+ /// The fixed framing that precedes every record payload.
+--- a/src/terminal/snapshot/snapshot.zig
++++ b/src/terminal/snapshot/snapshot.zig
+@@ -9,6 +9,7 @@
+ const envelope = @import("envelope.zig");
+ const test_fixture = @import("fixture.zig");
+ const history = @import("history.zig");
++const glyphs = @import("glyphs.zig");
+ const page = @import("page.zig");
+ const record = @import("record.zig");
+ const screen = @import("screen.zig");
+@@ -29,7 +30,7 @@
+     screen.EncodeError ||
+     history.EncodeError ||
+     checkpoint.EncodeError ||
+-    continuation.EncodeError;
++    continuation.EncodeError || glyphs.EncodeError;
+ 
+ pub const EncodeOptions = struct {
+     continuation: Continuation,
+@@ -61,6 +62,7 @@
+ 
+     // 2. Terminal
+     try terminal.encode(t, &stream);
++    try glyphs.encode(&t.glyph_glossary, &stream);
+ 
+     // 3. Primary and alt screen
+     try screen.encode(
+@@ -267,7 +269,7 @@
+     }
+ 
+     /// Errors possible while decoding the renderable prefix through READY.
+-    pub const ReadyError = envelope.DecodeError ||
++    pub const ReadyError = glyphs.DecodeError || envelope.DecodeError ||
+         terminal.DecodeError ||
+         screen.DecodeError ||
+         continuation.DecodeError ||
+@@ -305,6 +307,7 @@
+         // pointer, stay valid.
+         var result = try terminal.decode(reader, io_, alloc);
+         errdefer result.deinit(alloc);
++        try glyphs.decode(reader, alloc, &result.glyph_glossary);
+ 
+         // TERMINAL initializes exactly the number of screen slots it
+         // declared. Decode that many SCREEN sequences and route each one by
+--- /dev/null
++++ b/src/terminal/snapshot/glyphs.zig
+@@ -0,0 +1,76 @@
++//! Craft snapshot v2: restore validated glyph registrations without replaying
++//! terminal output, moving the cursor, or generating protocol responses.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Glyph = @import("../apc/glyph.zig");
++const record = @import("record.zig");
++const io = @import("io.zig");
++
++const max_registration_bytes = 1024 * 1024;
++const max_payload_bytes = 16 * 1024 * 1024;
++pub const EncodeError = std.Io.Writer.Error || record.Writer.FinishError || error{InvalidGlyphRecord};
++pub const DecodeError = std.Io.Reader.Error || Allocator.Error || record.Reader.InitError ||
++    record.Reader.FinishError || error{InvalidGlyphRecord};
++
++pub fn encode(glossary: *const Glyph.Glossary, stream: *record.Writer) EncodeError!void {
++    const count = glossary.entries.count();
++    if (count > Glyph.Glossary.max_entries) return error.InvalidGlyphRecord;
++    var size: usize = 2;
++    for (glossary.entries.keys(), glossary.entries.values()) |cp, entry| {
++        const raw = entry.registration;
++        if (raw.len == 0 or raw.len > max_registration_bytes) return error.InvalidGlyphRecord;
++        const request = Glyph.Request.Register.init(raw) orelse return error.InvalidGlyphRecord;
++        if (request.get(.cp) != cp) return error.InvalidGlyphRecord;
++        size += 8 + raw.len;
++        if (size > max_payload_bytes) return error.InvalidGlyphRecord;
++    }
++    const writer = stream.begin(.glyphs);
++    errdefer stream.cancel();
++    try io.writeInt(writer, u16, @intCast(count));
++    for (glossary.entries.keys(), glossary.entries.values()) |cp, entry| {
++        try io.writeInt(writer, u32, @intCast(cp));
++        try io.writeInt(writer, u32, @intCast(entry.registration.len));
++        try writer.writeAll(entry.registration);
++    }
++    try stream.finish();
++}
++
++pub fn decode(source: *std.Io.Reader, alloc: Allocator, glossary: *Glyph.Glossary) DecodeError!void {
++    var framed: record.Reader = undefined;
++    try framed.init(source);
++    if (framed.header.tag != .glyphs or framed.header.payload_len > max_payload_bytes)
++        return error.InvalidGlyphRecord;
++    const reader = framed.payloadReader();
++    const count = try io.readInt(reader, u16);
++    if (count > Glyph.Glossary.max_entries) return error.InvalidGlyphRecord;
++    var decoded: Glyph.Glossary = .empty;
++    errdefer decoded.deinit(alloc);
++    var consumed: usize = 2;
++    for (0..count) |_| {
++        const cp = std.math.cast(u21, try io.readInt(reader, u32)) orelse return error.InvalidGlyphRecord;
++        const length = try io.readInt(reader, u32);
++        consumed += 8;
++        if (length == 0 or length > max_registration_bytes or consumed + length > framed.header.payload_len)
++            return error.InvalidGlyphRecord;
++        const raw = try alloc.alloc(u8, length);
++        defer alloc.free(raw);
++        try reader.readSliceAll(raw);
++        consumed += length;
++        const request = Glyph.Request.Register.init(raw) orelse return error.InvalidGlyphRecord;
++        if (request.get(.cp) != cp or decoded.contains(cp)) return error.InvalidGlyphRecord;
++        var entry = Glyph.Glossary.Entry.init(alloc, request) catch |err| switch (err) {
++            error.OutOfMemory => return error.OutOfMemory,
++            else => return error.InvalidGlyphRecord,
++        };
++        decoded.register(alloc, cp, entry) catch |err| {
++            entry.deinit(alloc);
++            return switch (err) {
++                error.OutOfMemory => error.OutOfMemory,
++                else => error.InvalidGlyphRecord,
++            };
++        };
++    }
++    try framed.finish();
++    glossary.deinit(alloc);
++    glossary.* = decoded;
++}

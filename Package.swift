@@ -50,8 +50,8 @@ let package = Package(
         ),
         .binaryTarget(
             name: "libghostty",
-            url: "https://github.com/Lakr233/libghostty-spm/releases/download/upstream.3c47ca159368-2/GhosttyKit.xcframework.zip",
-            checksum: "804d4c92cad153eb8d85ed86f4c98ca587e90ff47ac0a62c846c985ece02a9c3"
+            url: "https://github.com/alexcding/ghostty-terminal-spm/releases/download/1.6.20260922-craft.1/GhosttyKit.xcframework.zip",
+            checksum: "7838038041b1a8e70329d9761287514a9afe9748f3024a9108f0e5884227aa68"
         ),
         .testTarget(
             name: "GhosttyKitTest",
