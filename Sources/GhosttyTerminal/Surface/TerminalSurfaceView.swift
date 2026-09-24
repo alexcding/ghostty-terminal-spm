@@ -30,10 +30,10 @@ public struct TerminalSurfaceView: View {
         representable
             .background(.clear)
             .onChange(of: colorScheme) { newScheme in
-                context.adopt(colorScheme: newScheme)
+                context.requestColorScheme(newScheme)
             }
             .onAppear {
-                context.adopt(colorScheme: colorScheme)
+                context.requestColorScheme(colorScheme)
             }
     }
 
