@@ -16,6 +16,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     private var lastResize: InMemoryTerminalViewport?
     private let writeHandler: @Sendable (Data) -> Void
     private let resizeHandler: @Sendable (InMemoryTerminalViewport) -> Void
+    private let appearanceHandler: @Sendable ([UInt32]) -> Void
 
     /// Skip resize dispatches whose grid is unchanged and only the pixel
     /// metrics moved.
@@ -30,14 +31,17 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// session's drags), and each one asks the terminal app for a full
     /// repaint that re-wraps its content.
     public let suppressesPixelOnlyResizes: Bool
+    private var usesGeometryCallbacks = false
 
     public init(
         write: @escaping @Sendable (Data) -> Void,
         resize: @escaping @Sendable (InMemoryTerminalViewport) -> Void,
+        appearance: @escaping @Sendable ([UInt32]) -> Void = { _ in },
         suppressesPixelOnlyResizes: Bool = false
     ) {
         writeHandler = write
         resizeHandler = resize
+        appearanceHandler = appearance
         self.suppressesPixelOnlyResizes = suppressesPixelOnlyResizes
         surfaceAccess = InMemoryTerminalSurfaceAccess(
             write: Self.writeToSurface,
@@ -59,6 +63,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     ) {
         writeHandler = write
         resizeHandler = resize
+        appearanceHandler = { _ in }
         self.suppressesPixelOnlyResizes = suppressesPixelOnlyResizes
         surfaceAccess = InMemoryTerminalSurfaceAccess(
             write: surfaceWrite,
@@ -91,6 +96,136 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     var currentSurface: ghostty_surface_t? {
         surfaceAccess.currentSurface
+    }
+
+    /// Imports initial state and its logical grid into a fresh surface.
+    /// Call before exposing the surface to user input or sending live output.
+    /// Invalid snapshots and non-fresh surfaces are left unchanged.
+    @MainActor
+    @discardableResult
+    public func restoreSnapshot(_ snapshot: Data) -> Bool {
+        guard !snapshot.isEmpty, snapshot.count <= 192 * 1024 * 1024 else { return false }
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            snapshot.withUnsafeBytes { bytes in
+                guard let pointer = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                return ghostty_surface_restore_snapshot(surface, pointer, UInt(bytes.count))
+            }
+        } ?? false
+    }
+
+    /// The version of the actual linked renderer, used for shell identity.
+    public static var runtimeVersion: String? {
+        let info = ghostty_info()
+        guard let version = info.version, info.version_len > 0, info.version_len <= 128 else { return nil }
+        return String(bytes: UnsafeRawBufferPointer(start: version, count: Int(info.version_len)), encoding: .utf8)
+    }
+
+    /// Enable daemon-identity-v1 (state plus DA/version/terminfo replies).
+    /// Requires an imported surface with the default clipboard-write policy.
+    @MainActor
+    public func enableHostIdentityResponses() -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_enable_host_identity_responses(surface)
+        } ?? false
+    }
+
+    /// Receive complete engine-ordered geometry, including cell pixels. The
+    /// resize handler must only enqueue host work and never re-enter a surface.
+    @MainActor
+    public func enableGeometryCallbacks() -> Bool {
+        surfaceAccess.withCurrentSurface { surface in
+            resizeLock.lock(); usesGeometryCallbacks = true; resizeLock.unlock()
+            let enabled = ghostty_surface_set_host_geometry_callback(surface, Self.receiveGeometryCallback)
+            if !enabled {
+                resizeLock.lock(); usesGeometryCallbacks = false; resizeLock.unlock()
+            }
+            return enabled
+        } ?? false
+    }
+
+    /// Callback data is already copied; handlers may enqueue host work only.
+    @MainActor
+    public func enableAppearanceCallbacks() -> Bool {
+        surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_set_host_appearance_callback(surface, Self.receiveAppearanceCallback)
+        } ?? false
+    }
+    @MainActor
+    public func enableHostAppearanceResponses() -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { ghostty_surface_enable_host_appearance_responses($0) } ?? false
+    }
+    public func applyHostAppearance(_ values: [UInt32]) -> Bool {
+        guard values.count == 260 else { return false }
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            values.withUnsafeBufferPointer { buffer in
+                ghostty_surface_apply_host_appearance(surface, buffer.baseAddress!, buffer.count)
+            }
+        } ?? false
+    }
+    static let receiveAppearanceCallback: ghostty_surface_host_appearance_cb = { userdata, values, count in
+        guard let userdata, let values, count == 260 else { return }
+        let session = Unmanaged<InMemoryTerminalSession>.fromOpaque(userdata).takeUnretainedValue()
+        session.appearanceHandler(Array(UnsafeBufferPointer(start: values, count: Int(count))))
+    }
+
+    /// Enable daemon-geometry-graphics-v2 (identity/state plus pixel size reports).
+    /// Requires complete imported pixel metrics and the native clipboard policy.
+    @MainActor
+    public func enableHostGeometryResponses() -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_enable_host_geometry_responses(surface)
+        } ?? false
+    }
+
+    /// Enable daemon-state-v1 after snapshot import, before metadata/live output.
+    /// The daemon must own this exact query set for the shell's whole lifetime.
+    @MainActor
+    public func enableHostStateResponses() -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_enable_host_state_responses(surface)
+        } ?? false
+    }
+
+    /// Publish imported title/pwd using native validation, without VT replay.
+    /// Call on a worker before feeding live output; the UI must keep ticking.
+    public func publishSnapshotMetadata() -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_publish_snapshot_metadata(surface)
+        } ?? false
+    }
+
+    /// Deliver queued metadata outside a surface operation. Callbacks may close
+    /// the surface, so ticking while holding an operation would deadlock teardown.
+    @MainActor
+    public func flushSnapshotMetadataCallbacks() -> Bool {
+        guard let surface = surfaceAccess.currentSurface else { return false }
+        Self.tickApp(surface)
+        return surfaceAccess.currentSurface != nil
+    }
+
+    /// Apply a daemon-ordered grid change after prior host output has drained.
+    /// The caller serializes this method with receive calls for the same session.
+    public func applyHostGridSize(columns: UInt16, rows: UInt16) -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_apply_host_grid_size(surface, columns, rows)
+        } ?? false
+    }
+
+    /// Apply the daemon's ordered cell/pixel geometry. Physical view layout
+    /// continues to use this surface's font metrics, without writing a reply.
+    public func applyHostGeometry(columns: UInt16, rows: UInt16, cellWidthPixels: UInt32, cellHeightPixels: UInt32) -> Bool {
+        surfaceAccess.waitForPendingOutput()
+        return surfaceAccess.withCurrentSurface { surface in
+            ghostty_surface_apply_host_geometry(surface, columns, rows, cellWidthPixels, cellHeightPixels)
+        } ?? false
     }
 
     // MARK: - Viewport Read
@@ -233,6 +368,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         let session = Unmanaged<InMemoryTerminalSession>
             .fromOpaque(userdata)
             .takeUnretainedValue()
+        session.resizeLock.lock()
+        let legacy = !session.usesGeometryCallbacks
+        session.resizeLock.unlock()
+        guard legacy else { return }
         TerminalDebugLog.log(
             .metrics,
             "receive resize cols=\(cols) rows=\(rows) pixels=\(widthPx)x\(heightPx)"
@@ -242,11 +381,19 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             rows: rows,
             widthPixels: widthPx,
             heightPixels: heightPx
-        ))
+        ), legacy: true)
     }
 
-    private func dispatchResize(_ resize: InMemoryTerminalViewport) {
+    static let receiveGeometryCallback: ghostty_surface_host_geometry_cb = { userdata, cols, rows, width, height, cellWidth, cellHeight in
+        guard let userdata else { return }
+        let session = Unmanaged<InMemoryTerminalSession>.fromOpaque(userdata).takeUnretainedValue()
+        session.dispatchResize(InMemoryTerminalViewport(columns: cols, rows: rows,
+            widthPixels: width, heightPixels: height, cellWidthPixels: cellWidth, cellHeightPixels: cellHeight))
+    }
+
+    private func dispatchResize(_ resize: InMemoryTerminalViewport, legacy: Bool = false) {
         resizeLock.lock()
+        if legacy, usesGeometryCallbacks { resizeLock.unlock(); return }
         let mergedResize = mergedResize(resize)
         guard mergedResize != lastResize else {
             resizeLock.unlock()

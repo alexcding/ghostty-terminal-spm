@@ -8,6 +8,19 @@
 import SwiftUI
 
 public extension TerminalViewState {
+    // SwiftUI lifecycle callbacks can run inside Update.dispatchActions. Keep
+    // the public imperative adopt API synchronous, but defer view-driven work.
+    // Only the latest request from the still-attached view/controller may apply.
+    internal func requestColorScheme(_ colorScheme: ColorScheme) {
+        let request = UUID()
+        colorSchemeRequest = request
+        terminalRunOnMainNextTurn { [weak self, weak view = attachedView, weak controller] in
+            guard let self, colorSchemeRequest == request, self.controller === controller,
+                  let view, attachedView === view, view.window != nil else { return }
+            adopt(colorScheme: colorScheme)
+        }
+    }
+
     func adopt(colorScheme: ColorScheme) {
         adopt(terminalColorScheme: TerminalColorScheme(colorScheme))
     }
