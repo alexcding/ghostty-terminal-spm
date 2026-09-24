@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ghostty-org/ghostty.git",
+  "revision": "3c47ca159368eb4a860ffe5333abdf4a85b2767b",
+  "wrapperRepository": "https://github.com/Lakr233/libghostty-spm.git",
+  "wrapperRevision": "b7f888e3baf8585ea9d590ab1a45b49475e00d1c",
+  "zigVersion": "0.16.0",
+  "zigURL": "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+  "zigSHA256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+}

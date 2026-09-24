@@ -1,0 +1,522 @@
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1194,6 +1194,16 @@
+ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_write_buffer(ghostty_surface_t, const uint8_t*, uintptr_t);
+ GHOSTTY_API void ghostty_surface_write_buffer_replay(ghostty_surface_t, const uint8_t*, uintptr_t);
++// Craft: fresh surface, UI thread, matching pinned revision; restores the captured grid.
++GHOSTTY_API bool ghostty_surface_restore_snapshot(ghostty_surface_t, const uint8_t*, uintptr_t);
++GHOSTTY_API bool ghostty_surface_enable_host_state_responses(ghostty_surface_t);
++bool ghostty_surface_enable_host_identity_responses(ghostty_surface_t);
++GHOSTTY_API bool ghostty_surface_enable_host_geometry_responses(ghostty_surface_t);
++typedef void (*ghostty_surface_host_geometry_cb)(void*, uint16_t, uint16_t, uint32_t, uint32_t, uint32_t, uint32_t);
++GHOSTTY_API bool ghostty_surface_set_host_geometry_callback(ghostty_surface_t, ghostty_surface_host_geometry_cb);
++bool ghostty_surface_publish_snapshot_metadata(ghostty_surface_t);
++GHOSTTY_API bool ghostty_surface_apply_host_grid_size(ghostty_surface_t, uint16_t, uint16_t);
++GHOSTTY_API bool ghostty_surface_apply_host_geometry(ghostty_surface_t, uint16_t, uint16_t, uint32_t, uint32_t);
+ GHOSTTY_API void ghostty_surface_process_exit(ghostty_surface_t, uint32_t, uint64_t);
+ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1517,7 +1517,9 @@
+     }
+ } else struct {
+     surface: *Surface = undefined,
+-    pub fn init(_: *Surface) !@This() { return .{}; }
++    pub fn init(_: *Surface) !@This() {
++        return .{};
++    }
+     pub fn deinit(_: *@This()) void {}
+ };
+ 
+@@ -1934,6 +1936,73 @@
+     ) void {
+         if (len == 0) return;
+         surface.core_surface.io.processOutputSuppressingResponses(ptr[0..len]);
++    }
++
++    /// Craft snapshot extension. Call on the UI thread on a fresh surface,
++    /// before exposing it to input. An invalid payload returns
++    /// false and preserves the original terminal. Revisions must match exactly.
++    export fn ghostty_surface_restore_snapshot(
++        surface: *Surface,
++        ptr: [*]const u8,
++        len: usize,
++    ) bool {
++        const core = &surface.core_surface;
++        if (core.search != null or core.mouse.selection_gesture.left_click_pin != null) return false;
++        core.io.restoreSnapshot(ptr[0..len]) catch |err| {
++            log.warn("snapshot import rejected err={}", .{err});
++            return false;
++        };
++        return true;
++    }
++
++    /// Opt in to daemon-state-v1 on a fresh imported surface before output.
++    export fn ghostty_surface_enable_host_state_responses(surface: *Surface) bool {
++        surface.core_surface.io.enableHostStateResponses(false, false) catch return false;
++        return true;
++    }
++
++    /// Adds DA/version/terminfo ownership using the shell's creation profile.
++    export fn ghostty_surface_enable_host_identity_responses(surface: *Surface) bool {
++        surface.core_surface.io.enableHostStateResponses(true, false) catch return false;
++        return true;
++    }
++
++    export fn ghostty_surface_set_host_geometry_callback(surface: *Surface, callback: termio.Termio.HostGeometryCallback) bool {
++        surface.core_surface.io.setHostGeometryCallback(callback) catch return false;
++        return true;
++    }
++
++    /// Adds pixel geometry ownership on a fresh snapshot with complete metrics.
++    export fn ghostty_surface_enable_host_geometry_responses(surface: *Surface) bool {
++        surface.core_surface.io.enableHostStateResponses(true, true) catch return false;
++        return true;
++    }
++
++    /// Worker-thread metadata publication, before any post-import host output.
++    export fn ghostty_surface_publish_snapshot_metadata(surface: *Surface) bool {
++        surface.core_surface.io.publishSnapshotMetadata() catch |err| {
++            log.warn("snapshot metadata rejected err={}", .{err});
++            return false;
++        };
++        return true;
++    }
++
++    /// Thread-safe when serialized with host output. Does not request another
++    /// backend resize; this acknowledges the daemon's already-applied grid.
++    export fn ghostty_surface_apply_host_grid_size(surface: *Surface, cols: u16, rows: u16) bool {
++        surface.core_surface.io.applyHostGridSize(cols, rows, null, null) catch |err| {
++            log.warn("host grid resize rejected err={}", .{err});
++            return false;
++        };
++        return true;
++    }
++
++    export fn ghostty_surface_apply_host_geometry(surface: *Surface, cols: u16, rows: u16, cell_width: u32, cell_height: u32) bool {
++        surface.core_surface.io.applyHostGridSize(cols, rows, cell_width, cell_height) catch |err| {
++            log.warn("host geometry resize rejected err={}", .{err});
++            return false;
++        };
++        return true;
+     }
+ 
+     export fn ghostty_surface_process_exit(
+--- a/src/termio/Termio.zig
++++ b/src/termio/Termio.zig
+@@ -64,6 +64,15 @@
+ /// The stream parser. This parses the stream of escape codes and so on
+ /// from the child process and calls callbacks in the stream handler.
+ terminal_stream: StreamHandler.Stream,
++
++/// A snapshot is an initial state, never a replacement for a live parser.
++host_output_received: bool = false,
++
++// Imported terminals follow the host output/resize event order.
++host_ordered_grid: bool = false,
++snapshot_metadata_pending: bool = false,
++host_snapshot_geometry: bool = false,
++host_geometry_callback: ?HostGeometryCallback = null,
+ 
+ /// Last time the cursor was reset. This is used to prevent message
+ /// flooding with cursor resets.
+@@ -498,7 +507,6 @@
+     td: *ThreadData,
+     size: renderer.Size,
+ ) !void {
+-    self.size = size;
+     const grid_size = size.grid();
+ 
+     // Update the size of our pty.
+@@ -509,22 +517,27 @@
+         self.renderer_state.mutex.lockUncancelable(global.io());
+         defer self.renderer_state.mutex.unlock(global.io());
+ 
+-        // Update the size of our terminal state
+-        try self.terminal.resize(
+-            self.alloc,
+-            .{
+-                .cols = grid_size.columns,
+-                .rows = grid_size.rows,
+-                .cell_size_px = .{
+-                    .width = self.size.cell.width,
+-                    .height = self.size.cell.height,
++        self.size = size;
++        self.notifyHostGeometry();
++        // Imported host state is resized only by its ordered daemon event.
++        if (!self.host_ordered_grid) {
++            // Update the size of our terminal state
++            try self.terminal.resize(
++                self.alloc,
++                .{
++                    .cols = grid_size.columns,
++                    .rows = grid_size.rows,
++                    .cell_size_px = .{
++                        .width = self.size.cell.width,
++                        .height = self.size.cell.height,
++                    },
+                 },
+-            },
+-        );
+-
+-        // If we have size reporting enabled we need to send a report.
+-        if (self.terminal.modes.get(.in_band_size_reports)) {
+-            try self.sizeReportLocked(td, .mode_2048);
++            );
++
++            // If we have size reporting enabled we need to send a report.
++            if (self.terminal.modes.get(.in_band_size_reports)) {
++                try self.sizeReportLocked(td, .mode_2048);
++            }
+         }
+     }
+ 
+@@ -533,6 +546,28 @@
+     self.renderer_wakeup.notify() catch {};
+ }
+ 
++/// Register a complete geometry callback. It runs under the renderer mutex;
++/// the host must enqueue work without re-entering the surface. Existing resize
++/// callbacks remain unchanged for clients that only consume the grid.
++pub const HostGeometryCallback = *const fn (?*anyopaque, u16, u16, u32, u32, u32, u32) callconv(.c) void;
++
++pub fn setHostGeometryCallback(self: *Termio, callback: HostGeometryCallback) !void {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (self.backend != .host_managed) return error.NotHostManaged;
++    self.host_geometry_callback = callback;
++    self.notifyHostGeometry();
++}
++
++fn notifyHostGeometry(self: *Termio) void {
++    const callback = self.host_geometry_callback orelse return;
++    if (self.backend != .host_managed) return;
++    const grid = self.size.grid();
++    const screen = self.size.terminal();
++    callback(self.backend.host_managed.userdata, grid.columns, grid.rows,
++        screen.width, screen.height, self.size.cell.width, self.size.cell.height);
++}
++
+ /// Make a size report.
+ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+     self.renderer_state.mutex.lockUncancelable(global.io());
+@@ -541,10 +576,11 @@
+ }
+ 
+ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
++    if (self.terminal_stream.handler.host_geometry_responses) return;
+     const grid_size = self.size.grid();
+     const report_size: terminalpkg.size_report.Size = .{
+-        .rows = grid_size.rows,
+-        .columns = grid_size.columns,
++        .rows = if (self.host_ordered_grid) self.terminal.rows else grid_size.rows,
++        .columns = if (self.host_ordered_grid) self.terminal.cols else grid_size.columns,
+         .cell_width = self.size.cell.width,
+         .cell_height = self.size.cell.height,
+     };
+@@ -695,8 +731,188 @@
+     self.processOutputLocked(buf);
+ }
+ 
++/// Import into a newly-created host-managed surface before host output or user
++/// interaction. The caller serializes this with surface input on the UI thread.
++/// Failed validation preserves the original terminal and parser.
++pub fn restoreSnapshot(self: *Termio, bytes: []const u8) !void {
++    if (bytes.len == 0 or bytes.len > 192 * 1024 * 1024) return error.InvalidSnapshotSize;
++    var source: std.Io.Reader = .fixed(bytes);
++    var decoded = try terminalpkg.snapshot.decodeExact(self.alloc, global.io(), &source, .{
++        .max_continuation_bytes = 1024 * 1024,
++    });
++    defer decoded.deinit(self.alloc);
++    const continuation: []const u8 = switch (decoded.continuation) {
++        .ground => &.{},
++        .bytes => |value| value,
++    };
++    const verification = try self.alloc.alloc(u8, continuation.len);
++    defer self.alloc.free(verification);
++
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (self.backend != .host_managed or self.host_output_received) return error.SurfaceNotFresh;
++    if (self.terminal.screens.active.selection != null or self.renderer_state.preedit != null)
++        return error.SurfaceNotFresh;
++    // The capture owns the logical grid. A physical view resize may still be
++    // queued; it must not change the imported grid ahead of daemon events.
++
++    // Preserve the host's visual defaults while retaining explicit program colors.
++    try decoded.terminal.?.colors.palette.changeDefault(self.alloc, self.config.palette);
++    decoded.terminal.?.colors.background.default = self.terminal.colors.background.default;
++    decoded.terminal.?.colors.foreground.default = self.terminal.colors.foreground.default;
++    decoded.terminal.?.colors.cursor.default = self.terminal.colors.cursor.default;
++    const snapshot_has_geometry = decoded.terminal.?.width_px != 0 and decoded.terminal.?.height_px != 0;
++    if (!snapshot_has_geometry) {
++        decoded.terminal.?.width_px = self.terminal.width_px;
++        decoded.terminal.?.height_px = self.terminal.height_px;
++    }
++
++    var previous = self.terminal;
++    self.terminal = decoded.toOwned();
++    errdefer {
++        self.terminal.deinit(self.alloc);
++        self.terminal = previous;
++    }
++    // Canonical continuation is reconstructed by the upstream supported readonly
++    // handler at the terminal's final address. It cannot replay bells, clipboard
++    // operations, protocol responses, or already-committed terminal changes.
++    var restored = terminalpkg.TerminalStream.init(.{
++        .allocator = self.alloc,
++        .handler = .{ .terminal = &self.terminal },
++        .continuation_max_bytes = 1024 * 1024,
++    });
++    errdefer restored.deinit();
++    restored.nextSlice(continuation);
++    var writer: std.Io.Writer = .fixed(verification);
++    try restored.writeContinuation(&writer);
++    if (!std.mem.eql(u8, continuation, writer.buffered()) or restored.handler.semantic_failure)
++        return error.InvalidContinuation;
++
++    // Both handlers use the same Parser, UTF8Decoder, APC and DCS types. Move
++    // their owned unfinished builders, not a second replay through a side-effect
++    // capable handler. From here normal live output uses the embedding handler.
++    const handler: StreamHandler = .{
++        .alloc = self.alloc,
++        .size = &self.size,
++        .terminal = &self.terminal,
++        .termio_mailbox = &self.mailbox,
++        .surface_mailbox = self.surface_mailbox,
++        .renderer_state = self.renderer_state,
++        .renderer_wakeup = self.renderer_wakeup,
++        .renderer_mailbox = self.renderer_mailbox,
++        .enquiry_response = self.config.enquiry_response,
++        .osc_color_report_format = self.config.osc_color_report_format,
++        .clipboard_write = self.config.clipboard_write,
++        .clipboard_write_limit = self.config.clipboard_write_limit,
++        .apc = restored.handler.apc_handler,
++        .dcs = restored.handler.dcs_handler,
++        .kitty_clipboard_write = restored.handler.kitty_clipboard_write,
++        .kitty_clipboard_grants = restored.handler.kitty_clipboard_grants,
++        .seen_title = self.terminal.getTitle() != null,
++    };
++    self.terminal_stream.deinit();
++    self.terminal_stream = .{
++        .handler = handler,
++        .parser = restored.parser,
++        .utf8decoder = restored.utf8decoder,
++        .continuation = null,
++    };
++    // All other owned stream state moved above. The native stream does not
++    // export snapshots; only the daemon tracks subsequent continuation bytes.
++    if (restored.continuation) |*tracker| tracker.deinit();
++    previous.deinit(self.alloc);
++    self.host_output_received = true;
++    self.host_ordered_grid = true;
++    self.snapshot_metadata_pending = true;
++    self.host_snapshot_geometry = snapshot_has_geometry;
++    self.terminal.flags.dirty = .{
++        .palette = true,
++        .reverse_colors = true,
++        .clear = true,
++        .preedit = true,
++        .glyph_glossary = true,
++    };
++    self.renderer_wakeup.notify() catch {};
++}
++
++/// Select daemon-state-v1 only after importing a fresh host-owned snapshot.
++/// Ownership cannot change after live output, eliminating attach/detach races.
++pub fn enableHostStateResponses(self: *Termio, identity: bool, geometry: bool) !void {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (!self.host_ordered_grid or !self.snapshot_metadata_pending or
++        self.backend != .host_managed) return error.NoFreshImportedState;
++    // The identity profile advertises clipboard access using the native
++    // default policy. Reject a mismatched surface instead of lying to programs.
++    if (identity and self.terminal_stream.handler.clipboard_write != .allow)
++        return error.IncompatibleClipboardPolicy;
++    if (geometry) {
++        const t = &self.terminal;
++        if (!identity or !self.host_snapshot_geometry or t.width_px == 0 or t.height_px == 0 or
++            t.width_px > 65535 or t.height_px > 65535 or
++            t.width_px % t.cols != 0 or t.height_px % t.rows != 0)
++            return error.InvalidHostGeometry;
++    }
++    if (self.terminal_stream.handler.host_geometry_responses and !geometry)
++        return error.CannotChangeGeometryOwner;
++    self.terminal_stream.handler.host_state_responses = true;
++    self.terminal_stream.handler.host_identity_responses = identity;
++    self.terminal_stream.handler.host_geometry_responses = geometry;
++}
++
++/// Run off the UI thread before live output. A full app mailbox can block
++/// until the UI ticks; callers must not hold up that event loop.
++pub fn publishSnapshotMetadata(self: *Termio) !void {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (!self.snapshot_metadata_pending) return error.NoPendingSnapshotMetadata;
++    self.snapshot_metadata_pending = false;
++    try self.terminal_stream.handler.publishSnapshotMetadata();
++}
++
++/// Apply a daemon resize at its position in the output sequence. The host
++/// serializes this with its writes, while view/pixel resizes only request a new
++/// daemon size. This avoids reflowing output that predates the resize event.
++pub fn applyHostGridSize(self: *Termio, cols: u16, rows: u16, cell_width: ?u32, cell_height: ?u32) !void {
++    if (cols == 0 or rows == 0 or cols > 4096 or rows > 4096 or
++        @as(u32, cols) * @as(u32, rows) > 1024 * 1024) return error.InvalidGrid;
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    if (!self.host_ordered_grid or self.backend != .host_managed) return error.NoImportedState;
++    const geometry_owned = self.terminal_stream.handler.host_geometry_responses;
++    if (geometry_owned != (cell_width != null) or geometry_owned != (cell_height != null))
++        return error.IncompatibleGeometryOwner;
++    const width = cell_width orelse self.size.cell.width;
++    const height = cell_height orelse self.size.cell.height;
++    if (geometry_owned and (width == 0 or height == 0 or
++        @as(u64, width) * cols > 65535 or @as(u64, height) * rows > 65535))
++        return error.InvalidHostGeometry;
++    try self.terminal.resize(self.alloc, .{
++        .cols = cols,
++        .rows = rows,
++        .cell_size_px = .{ .width = width, .height = height },
++    });
++    if (!geometry_owned and self.terminal.modes.get(.in_band_size_reports)) {
++        var buf: [1024]u8 = undefined;
++        var writer: std.Io.Writer = .fixed(&buf);
++        try terminalpkg.size_report.encode(&writer, .mode_2048, .{
++            .rows = rows,
++            .columns = cols,
++            .cell_width = self.size.cell.width,
++            .cell_height = self.size.cell.height,
++        });
++        self.mailbox.send(try termio.Message.writeReq(self.alloc, writer.buffered()), self.renderer_state.mutex);
++        self.mailbox.notify();
++    }
++    self.renderer_wakeup.notify() catch {};
++}
++
+ /// Process output from readdata but the lock is already held.
+ fn processOutputLocked(self: *Termio, buf: []const u8) void {
++    if (buf.len > 0) {
++        self.host_output_received = true;
++        self.snapshot_metadata_pending = false;
++    }
+     // Schedule a render. We can call this first because we have the lock.
+     self.terminal_stream.handler.queueRender() catch unreachable;
+ 
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -93,6 +93,12 @@
+     /// sends meanwhile (changeConfig's color_scheme_report) must not be
+     /// discarded as part of the replay.
+     suppress_terminal_responses: bool = false,
++
++    /// Persistent daemon-state-v1 ownership. Only state query handlers consult
++    /// this flag; clipboard, geometry, colors, and UI effects remain native.
++    host_state_responses: bool = false,
++    host_identity_responses: bool = false,
++    host_geometry_responses: bool = false,
+ 
+     /// This is set to true when we've seen a title escape sequence. We use
+     /// this to determine if we need to default the window title.
+@@ -498,6 +504,7 @@
+             },
+ 
+             .xtgettcap => |*gettcap| {
++                if (self.host_identity_responses) return;
+                 const map = comptime terminfo.ghostty.xtgettcapMap();
+                 while (gettcap.next()) |key| {
+                     const response = map.get(key) orelse continue;
+@@ -506,6 +513,7 @@
+             },
+ 
+             .decrqss => |decrqss| {
++                if (self.host_state_responses) return;
+                 var response: [terminal.dcs.Command.DECRQSS.max_response_bytes]u8 = undefined;
+                 const encoded = try decrqss.encode(self.terminal, &response);
+                 const msg = try termio.Message.writeReq(
+@@ -612,6 +620,8 @@
+     }
+ 
+     fn sendModeReport(self: *StreamHandler, report: terminal.modes.Report) void {
++        if (self.host_state_responses and
++            (report.tag.ansi or report.tag.value != 5522)) return;
+         var data: termio.Message.WriteReq.Small.Array = undefined;
+         var writer: std.Io.Writer = .fixed(&data);
+         report.encode(&writer) catch |err| {
+@@ -743,7 +753,7 @@
+                 self.messageWriter(.{ .linefeed_mode = enabled });
+             },
+ 
+-            .in_band_size_reports => if (enabled) self.messageWriter(.{
++            .in_band_size_reports => if (enabled and !self.host_geometry_responses) self.messageWriter(.{
+                 .size_report = .mode_2048,
+             }),
+ 
+@@ -816,6 +826,7 @@
+         self: *StreamHandler,
+         req: terminal.DeviceAttributeReq,
+     ) !void {
++        if (self.host_identity_responses) return;
+         // For the below, we quack as a VT220. We don't quack as
+         // a 420 because we don't support DCS sequences.
+         switch (req) {
+@@ -841,6 +852,10 @@
+         self: *StreamHandler,
+         req: terminal.device_status.Request,
+     ) !void {
++        if (self.host_state_responses) switch (req) {
++            .operating_status, .cursor_position => return,
++            else => {},
++        };
+         switch (req) {
+             .operating_status => self.messageWriter(.{ .write_stable = "\x1B[0n" }),
+ 
+@@ -931,6 +946,7 @@
+     }
+ 
+     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
++        if (self.host_state_responses) return;
+         log.debug("querying kitty keyboard mode", .{});
+         var data: termio.Message.WriteReq.Small.Array = undefined;
+         const resp = try std.fmt.bufPrint(&data, "\x1b[?{}u", .{
+@@ -948,6 +964,7 @@
+     pub fn reportXtversion(
+         self: *StreamHandler,
+     ) !void {
++        if (self.host_identity_responses) return;
+         log.debug("reporting XTVERSION: ghostty {s}", .{build_config.version_string});
+         var buf: [288]u8 = undefined;
+         const resp = try std.fmt.bufPrint(
+@@ -1482,6 +1499,22 @@
+         // We do this last so failures are still processed correctly
+         // above.
+         try self.terminal.semanticPrompt(cmd);
++    }
++
++    /// Publish snapshot metadata through the normal native validation/callback
++    /// paths without feeding bytes into an unfinished VT parser.
++    pub fn publishSnapshotMetadata(self: *StreamHandler) !void {
++        const pwd = try self.alloc.dupe(u8, self.terminal.getPwd() orelse "");
++        defer self.alloc.free(pwd);
++        const title = try self.alloc.dupe(u8, self.terminal.getTitle() orelse "");
++        defer self.alloc.free(title);
++        self.seen_title = title.len > 0;
++        // The readonly snapshot parser stores OSC 7's URI. The embedding
++        // handler stores a validated local path. Never expose the raw URI.
++        self.terminal.setPwd("") catch unreachable;
++        self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
++        if (pwd.len > 0) try self.reportPwd(pwd);
++        try self.windowTitle(title);
+     }
+ 
+     fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+@@ -1813,6 +1846,7 @@
+ 
+     /// Send a report to the pty.
+     pub fn sendSizeReport(self: *StreamHandler, style: terminal.SizeReportStyle) void {
++        if (self.host_geometry_responses and style != .csi_21_t) return;
+         switch (style) {
+             .csi_14_t => self.messageWriter(.{ .size_report = .csi_14_t }),
+             .csi_16_t => self.messageWriter(.{ .size_report = .csi_16_t }),

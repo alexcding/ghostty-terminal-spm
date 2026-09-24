@@ -1,0 +1,487 @@
+--- a/src/terminal/snapshot/envelope.zig
++++ b/src/terminal/snapshot/envelope.zig
+@@ -26,7 +26,7 @@
+ 
+ /// The complete compatibility boundary for snapshot layout and behavior.
+ /// Version 1 readers require this value to match exactly.
+-pub const version: u16 = 2; // Craft extension, negotiated as craft-glyph-v2.
++pub const version: u16 = 3; // Craft extension, negotiated as craft-glyph-v2.
+ 
+ /// Number of bytes in the fixed envelope: magic followed by version.
+ pub const encoded_len = computeLen();
+--- a/src/terminal/snapshot/record.zig
++++ b/src/terminal/snapshot/record.zig
+@@ -55,6 +55,9 @@
+ 
+     /// Craft: validated glyph registrations in FIFO order.
+     glyphs = 8,
++
++    /// Craft: owned Kitty images and placements after full history.
++    graphics = 9,
+ };
+ 
+ /// The fixed framing that precedes every record payload.
+--- a/src/terminal/snapshot/snapshot.zig
++++ b/src/terminal/snapshot/snapshot.zig
+@@ -10,6 +10,7 @@
+ const test_fixture = @import("fixture.zig");
+ const history = @import("history.zig");
+ const glyphs = @import("glyphs.zig");
++const graphics = @import("graphics.zig");
+ const page = @import("page.zig");
+ const record = @import("record.zig");
+ const screen = @import("screen.zig");
+@@ -30,7 +31,7 @@
+     screen.EncodeError ||
+     history.EncodeError ||
+     checkpoint.EncodeError ||
+-    continuation.EncodeError || glyphs.EncodeError;
++    continuation.EncodeError || glyphs.EncodeError || graphics.EncodeError;
+ 
+ pub const EncodeOptions = struct {
+     continuation: Continuation,
+@@ -95,6 +96,8 @@
+     );
+ 
+     // 7. Finish
++    try graphics.encode(t.screens.get(.primary).?, .primary, &stream);
++    if (t.screens.get(.alternate)) |alternate| try graphics.encode(alternate, .alternate, &stream);
+     try checkpoint.encode(.finish, &stream);
+ }
+ 
+@@ -407,7 +410,7 @@
+     };
+ 
+     /// Errors possible while decoding history records through FINISH.
+-    pub const NextError = checkpoint.DecodeError ||
++    pub const NextError = graphics.DecodeError || checkpoint.DecodeError ||
+         history.Decoder.InitError ||
+         page.DiscardError ||
+         page.DecodeError ||
+@@ -485,6 +488,15 @@
+             // All sequences are consumed: FINISH ends the snapshot, leaving
+             // trailing transport bytes unread.
+             if (state.pending == 0) {
++                // Craft restores through FINISH before delivering post-cut output.
++                // Never install graphics into a replaced or reflowed screen.
++                var graphics_screens = state.generations.iterator();
++                while (graphics_screens.next()) |entry| {
++                    const destination = t.screens.get(entry.key) orelse return error.InvalidGraphicsRecord;
++                    if (t.cols != state.cols or t.screens.generation(entry.key) != entry.value.*)
++                        return error.InvalidGraphicsRecord;
++                    try graphics.decode(self.source, alloc, destination, entry.key);
++                }
+                 try checkpoint.decode(.finish, self.source);
+                 if (comptime build_options.slow_runtime_safety) {
+                     var it = state.generations.iterator();
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -272,10 +272,7 @@
+ 
+     /// The total storage limit for Kitty images in bytes for this
+     /// screen. Kitty image storage is per-screen.
+-    kitty_image_storage_limit: usize = switch (build_options.artifact) {
+-        .ghostty => 320 * 1000 * 1000, // 320MB
+-        .lib => 10 * 1000 * 1000, // 10MB
+-    },
++    kitty_image_storage_limit: usize = 32 * 1024 * 1024,
+ 
+     /// The limits for what medium types are allowed for Kitty image loading.
+     kitty_image_loading_limits: if (build_options.kitty_graphics)
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -288,14 +288,7 @@
+ 
+     /// The total storage limit for Kitty images in bytes. Has no effect
+     /// if kitty images are disabled at build-time.
+-    kitty_image_storage_limit: usize = switch (build_options.artifact) {
+-        .ghostty => 320 * 1000 * 1000, // 320MB
+-
+-        // libghostty we start with a much lower limit since this is an
+-        // embedded library and we want to be more conservative with memory
+-        // usage by default.
+-        .lib => 10 * 1000 * 1000, // 10MB
+-    },
++    kitty_image_storage_limit: usize = 32 * 1024 * 1024,
+ 
+     /// The limits for what medium types are allowed for Kitty image loading.
+     /// Has no effect if kitty images are disabled otherwise. For example,
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -131,7 +131,7 @@
+     /// If the limit is reached, the oldest images will be evicted to make
+     /// space. Unused images take priority.
+     total_bytes: usize = 0,
+-    total_limit: usize = 320 * 1000 * 1000, // 320MB
++    total_limit: usize = 32 * 1024 * 1024, // Craft per-screen image budget
+ 
+     /// Identifies one exact pending image transmission. The generation is
+     /// assigned by this storage when the pending image is inserted, so a
+@@ -670,6 +670,10 @@
+     /// effect lazily by dropping unresolvable placements while drawing;
+     /// we do it eagerly because our renderer never mutates terminal
+     /// state.
++    pub fn pruneSnapshotOrphans(self: *ImageStorage, s: *terminal.Screen) void {
++        _ = self.removeOrphans(s, null);
++    }
++
+     fn removeOrphans(
+         self: *ImageStorage,
+         s: *terminal.Screen,
+--- a/src/terminal/kitty/graphics_image.zig
++++ b/src/terminal/kitty/graphics_image.zig
+@@ -18,7 +18,7 @@
+ const max_dimension = 10000;
+ 
+ /// Maximum size in bytes, taken from Kitty.
+-const max_size = 400 * 1024 * 1024; // 400MB
++const max_size = 32 * 1024 * 1024; // Craft: match detached/native transfer budgets
+ 
+ /// An image that is still being loaded. The image should be initialized
+ /// using init on the first chunk and then addData for each subsequent
+--- a/src/terminal/sys.zig
++++ b/src/terminal/sys.zig
+@@ -16,7 +16,7 @@
+ /// and the exact semantics are up to callers. For example, the Kitty Graphics
+ /// Protocol will work but cannot accept PNG images.
+ pub var decode_png: ?DecodePngFn = png: {
+-    if (build_options.artifact == .lib) break :png null;
++    // Craft ships Wuffs in both runtimes so detached PNGs decode identically.
+     break :png &decodePngWuffs;
+ };
+ 
+--- /dev/null
++++ b/src/terminal/snapshot/graphics.zig
+@@ -0,0 +1,332 @@
++//! Craft v3. Graphics are restored as owned state after history, never as APC
++//! replay. Wire scalars have explicit widths, independent of C/Zig ABI layout.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Screen = @import("../Screen.zig");
++const ScreenKey = @import("../ScreenSet.zig").Key;
++const storage = @import("../kitty/graphics_storage.zig");
++const ImageStorage = storage.ImageStorage;
++const Image = @import("../kitty/graphics_image.zig").Image;
++const LoadingImage = @import("../kitty/graphics_image.zig").LoadingImage;
++const Animation = @import("../kitty/graphics_animation.zig").Animation;
++const command = @import("../kitty/graphics_command.zig");
++const record = @import("record.zig");
++const io = @import("io.zig");
++
++pub const storage_limit = 32 * 1024 * 1024;
++const payload_limit = 80 * 1024 * 1024;
++const entry_limit = 65536;
++pub const EncodeError = std.Io.Writer.Error || record.Writer.FinishError || error{InvalidGraphicsRecord};
++pub const DecodeError = std.Io.Reader.Error || Allocator.Error || record.Reader.InitError ||
++    record.Reader.FinishError || error{InvalidGraphicsRecord};
++
++const ImageHeader = struct {
++    id: u32,
++    number: u32,
++    width: u32,
++    height: u32,
++    format: command.Transmission.Format,
++    compression: command.Transmission.Compression,
++    transient: bool,
++    implicit_id: bool,
++    generation: u64,
++};
++const AnimationHeader = struct {
++    root_gap_ms: u32,
++    current_index: u32,
++    state: Animation.State,
++    max_loops: u32,
++    current_loop: u32,
++};
++const PlacementHeader = struct {
++    key: ImageStorage.PlacementKey,
++    x_offset: u32,
++    y_offset: u32,
++    source_x: u32,
++    source_y: u32,
++    source_width: u32,
++    source_height: u32,
++    columns: u32,
++    rows: u32,
++    z: i32,
++};
++
++fn writeValue(writer: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
++    const T = @TypeOf(value);
++    switch (@typeInfo(T)) {
++        .int => |info| try io.writeInt(writer, if (info.signedness == .signed) i64 else u64, value),
++        .bool => try writer.writeByte(if (value) 1 else 0),
++        .@"enum" => try io.writeInt(writer, u32, @intCast(@intFromEnum(value))),
++        .optional => {
++            try writeValue(writer, value != null);
++            if (value) |v| try writeValue(writer, v);
++        },
++        .@"struct" => |info| inline for (info.fields) |field| try writeValue(writer, @field(value, field.name)),
++        else => @compileError("Snapshot field needs an explicit owned-data codec: " ++ @typeName(T)),
++    }
++}
++
++fn readValue(reader: *std.Io.Reader, comptime T: type) DecodeError!T {
++    return switch (@typeInfo(T)) {
++        .int => |info| std.math.cast(T, try io.readInt(reader, if (info.signedness == .signed) i64 else u64)) orelse error.InvalidGraphicsRecord,
++        .bool => switch (try reader.takeByte()) {
++            0 => false,
++            1 => true,
++            else => error.InvalidGraphicsRecord,
++        },
++        .@"enum" => std.enums.fromInt(T, try io.readInt(reader, u32)) orelse error.InvalidGraphicsRecord,
++        .optional => |info| if (try readValue(reader, bool)) try readValue(reader, info.child) else null,
++        .@"struct" => |info| result: {
++            var result: T = undefined;
++            inline for (info.fields) |field| @field(result, field.name) = try readValue(reader, field.type);
++            break :result result;
++        },
++        else => @compileError("Snapshot field needs an explicit owned-data codec: " ++ @typeName(T)),
++    };
++}
++
++fn writeBlob(writer: *std.Io.Writer, bytes: []const u8) EncodeError!void {
++    if (bytes.len > storage_limit or writer.buffered().len + bytes.len + 4 > payload_limit)
++        return error.InvalidGraphicsRecord;
++    try io.writeInt(writer, u32, @intCast(bytes.len));
++    try writer.writeAll(bytes);
++}
++
++fn readBlob(reader: *std.Io.Reader, alloc: Allocator, remaining: *usize) DecodeError![]u8 {
++    const len = try io.readInt(reader, u32);
++    if (len > storage_limit or len > remaining.*) return error.InvalidGraphicsRecord;
++    remaining.* -= len;
++    const result = try alloc.alloc(u8, len);
++    errdefer alloc.free(result);
++    try reader.readSliceAll(result);
++    return result;
++}
++
++fn validImage(img: *const Image, loading: bool) bool {
++    if (img.width > 10000 or img.height > 10000 or img.storageSize() > storage_limit) return false;
++    if (loading) return img.animation == null and img.data.len() == 0;
++    if (img.id == 0 or img.width == 0 or img.height == 0 or img.format == .png or img.compression != .none) return false;
++    const expected = @as(u64, img.width) * img.height * command.Transmission.formatBpp(img.format);
++    if (img.data.len() != expected) return false;
++    if (img.animation) |anim| {
++        if (anim.current_index > anim.frames.items.len or anim.frames.items.len > entry_limit) return false;
++        if (anim.frames.items.len > 0 and img.format != .rgba) return false;
++        for (anim.frames.items) |frame| if (frame.data.len != @as(u64, img.width) * img.height * 4) return false;
++    }
++    return true;
++}
++
++fn writeImage(writer: *std.Io.Writer, img: *const Image, loading: bool) EncodeError!void {
++    if (!validImage(img, loading)) return error.InvalidGraphicsRecord;
++    try writeValue(writer, ImageHeader{
++        .id = img.id,
++        .number = img.number,
++        .width = img.width,
++        .height = img.height,
++        .format = img.format,
++        .compression = img.compression,
++        .transient = img.metadata.transient,
++        .implicit_id = img.metadata.implicit_id,
++        .generation = img.generation,
++    });
++    try writeValue(writer, img.data == .pending);
++    switch (img.data) {
++        .complete => |bytes| try writeBlob(writer, bytes),
++        .pending => |len| try writeValue(writer, @as(u32, @intCast(len))),
++    }
++    try writeValue(writer, img.animation != null);
++    if (img.animation) |anim| {
++        try writeValue(writer, AnimationHeader{ .root_gap_ms = anim.root_gap_ms, .current_index = anim.current_index, .state = anim.state, .max_loops = anim.max_loops, .current_loop = anim.current_loop });
++        try writeValue(writer, @as(u32, @intCast(anim.frames.items.len)));
++        for (anim.frames.items) |frame| {
++            try writeValue(writer, frame.gap_ms);
++            try writeBlob(writer, frame.data);
++        }
++    }
++}
++
++fn readImage(reader: *std.Io.Reader, alloc: Allocator, remaining: *usize, loading: bool) DecodeError!Image {
++    const h = try readValue(reader, ImageHeader);
++    var img: Image = .{ .id = h.id, .number = h.number, .width = h.width, .height = h.height, .format = h.format, .compression = h.compression, .generation = h.generation, .metadata = .{ .transient = h.transient, .implicit_id = h.implicit_id } };
++    errdefer img.deinit(alloc);
++    img.data = if (try readValue(reader, bool))
++        .{ .pending = try readValue(reader, u32) }
++    else
++        .{ .complete = try readBlob(reader, alloc, remaining) };
++    if (try readValue(reader, bool)) {
++        const a = try readValue(reader, AnimationHeader);
++        const count = try readValue(reader, u32);
++        if (loading or count > entry_limit) return error.InvalidGraphicsRecord;
++        const anim = try alloc.create(Animation);
++        anim.* = .{ .root_gap_ms = a.root_gap_ms, .current_index = a.current_index, .state = a.state, .max_loops = a.max_loops, .current_loop = a.current_loop };
++        // Renderer clocks are local. Resume the saved frame with a fresh tick.
++        img.animation = anim;
++        for (0..count) |_| {
++            const gap = try readValue(reader, u32);
++            const data = try readBlob(reader, alloc, remaining);
++            errdefer alloc.free(data);
++            try anim.frames.append(alloc, .{ .gap_ms = gap, .data = data });
++        }
++    }
++    if (!validImage(&img, loading)) return error.InvalidGraphicsRecord;
++    return img;
++}
++
++pub fn encode(s: *const Screen, key: ScreenKey, stream: *record.Writer) EncodeError!void {
++    const images = &s.kitty_images;
++    if (images.total_limit > storage_limit or images.total_bytes > storage_limit or
++        images.images.count() > entry_limit or images.placements.count() > entry_limit)
++        return error.InvalidGraphicsRecord;
++    const writer = stream.begin(.graphics);
++    errdefer stream.cancel();
++    try writeValue(writer, key);
++    try writeValue(writer, @as(u32, @intCast(images.total_limit)));
++    try writeValue(writer, images.next_image_id);
++    try writeValue(writer, images.next_internal_placement_id);
++    try writeValue(writer, @as(u32, @intCast(images.images.count())));
++    var it = images.images.iterator();
++    while (it.next()) |entry| {
++        if (entry.key_ptr.* != entry.value_ptr.id) return error.InvalidGraphicsRecord;
++        try writeImage(writer, entry.value_ptr, false);
++    }
++    try writeValue(writer, @as(u32, @intCast(images.placements.count())));
++    var placements = images.placements.iterator();
++    while (placements.next()) |entry| {
++        const p = entry.value_ptr;
++        try writeValue(writer, PlacementHeader{ .key = entry.key_ptr.*, .x_offset = p.x_offset, .y_offset = p.y_offset, .source_x = p.source_x, .source_y = p.source_y, .source_width = p.source_width, .source_height = p.source_height, .columns = p.columns, .rows = p.rows, .z = p.z });
++        switch (p.location) {
++            .pin => |pin| {
++                try writer.writeByte(0);
++                const coord = (s.pages.pointFromPin(.screen, pin.*) orelse return error.InvalidGraphicsRecord).coord();
++                try writeValue(writer, coord.x);
++                // Distance from the bottom survives page granularity and history truncation.
++                try writeValue(writer, @as(u64, s.pages.total_rows - 1 - coord.y));
++            },
++            .virtual => try writer.writeByte(1),
++            .relative => |relative| {
++                try writer.writeByte(2);
++                try writeValue(writer, relative);
++            },
++        }
++        if (writer.buffered().len > payload_limit) return error.InvalidGraphicsRecord;
++    }
++    try writeValue(writer, images.loading != null);
++    if (images.loading) |loading| {
++        if (!loading.response.ok()) return error.InvalidGraphicsRecord;
++        try writeImage(writer, &loading.image, true);
++        try writeBlob(writer, loading.data.items);
++        try writeValue(writer, loading.display);
++        try writeValue(writer, loading.frame);
++        try writeValue(writer, loading.quiet);
++        try writeValue(writer, loading.response.id);
++        try writeValue(writer, loading.response.image_number);
++        try writeValue(writer, loading.response.placement_id);
++        try writeValue(writer, loading.response.frame);
++    }
++    if (writer.buffered().len > payload_limit) return error.InvalidGraphicsRecord;
++    try stream.finish();
++}
++
++pub fn decode(source: *std.Io.Reader, alloc: Allocator, s: *Screen, expected_key: ScreenKey) DecodeError!void {
++    var framed: record.Reader = undefined;
++    try framed.init(source);
++    if (framed.header.tag != .graphics or framed.header.payload_len > payload_limit) return error.InvalidGraphicsRecord;
++    const reader = framed.payloadReader();
++    if (try readValue(reader, ScreenKey) != expected_key) return error.InvalidGraphicsRecord;
++    const limit = try readValue(reader, u32);
++    if (limit > storage_limit) return error.InvalidGraphicsRecord;
++    var images: ImageStorage = .{ .total_limit = limit, .image_limits = .direct, .next_image_id = try readValue(reader, u32), .next_internal_placement_id = try readValue(reader, u32) };
++    errdefer images.deinit(alloc, s);
++    var remaining: usize = storage_limit;
++    const count = try readValue(reader, u32);
++    if (count > entry_limit) return error.InvalidGraphicsRecord;
++    for (0..count) |_| {
++        var img = try readImage(reader, alloc, &remaining, false);
++        errdefer img.deinit(alloc);
++        if (images.images.contains(img.id)) return error.InvalidGraphicsRecord;
++        images.total_bytes += img.storageSize();
++        if (images.total_bytes > limit) return error.InvalidGraphicsRecord;
++        try images.images.put(alloc, img.id, img);
++    }
++    const placements = try readValue(reader, u32);
++    if (placements > entry_limit) return error.InvalidGraphicsRecord;
++    for (0..placements) |_| {
++        const h = try readValue(reader, PlacementHeader);
++        if (!images.images.contains(h.key.image_id) or images.placements.contains(h.key)) return error.InvalidGraphicsRecord;
++        var p: ImageStorage.Placement = .{ .location = .virtual, .x_offset = h.x_offset, .y_offset = h.y_offset, .source_x = h.source_x, .source_y = h.source_y, .source_width = h.source_width, .source_height = h.source_height, .columns = h.columns, .rows = h.rows, .z = h.z };
++        switch (try reader.takeByte()) {
++            0 => {
++                const x = try readValue(reader, u16);
++                const bottom = try readValue(reader, u64);
++                if (bottom >= s.pages.total_rows or x >= s.pages.cols) continue;
++                const y = std.math.cast(u32, s.pages.total_rows - 1 - bottom) orelse continue;
++                const pin = s.pages.pin(.{ .screen = .{ .x = x, .y = y } }) orelse continue;
++                p.location = .{ .pin = try s.pages.trackPin(pin) };
++            },
++            1 => {},
++            2 => p.location = .{ .relative = try readValue(reader, ImageStorage.Placement.Relative) },
++            else => return error.InvalidGraphicsRecord,
++        }
++        errdefer p.deinit(s);
++        try images.placements.put(alloc, h.key, p);
++        images.images.getPtr(h.key.image_id).?.metadata.placement_count += 1;
++    }
++    if (try readValue(reader, bool)) {
++        const loading = try alloc.create(LoadingImage);
++        loading.* = .{ .image = .{}, .quiet = .no, .temporary_directory = null };
++        images.loading = loading;
++        remaining = storage_limit;
++        loading.image = try readImage(reader, alloc, &remaining, true);
++        const bytes = try readBlob(reader, alloc, &remaining);
++        loading.data = .{ .items = bytes, .capacity = bytes.len };
++        loading.display = try readValue(reader, ?command.Display);
++        loading.frame = try readValue(reader, ?LoadingImage.FrameContext);
++        loading.quiet = try readValue(reader, command.Command.Quiet);
++        loading.response = .{ .id = try readValue(reader, u32), .image_number = try readValue(reader, u32), .placement_id = try readValue(reader, u32), .frame = try readValue(reader, u32) };
++    }
++    try framed.finish();
++
++    // Rebase image stamps in original age order: eviction order remains stable,
++    // while no texture cache in this process can mistake restored pixels for old ones.
++    const ages = try alloc.alloc(*Image, images.images.count());
++    defer alloc.free(ages);
++    var it = images.images.valueIterator();
++    var index: usize = 0;
++    while (it.next()) |img| : (index += 1) ages[index] = img;
++    std.mem.sort(*Image, ages, {}, struct {
++        fn less(_: void, a: *Image, b: *Image) bool {
++            return a.generation < b.generation;
++        }
++    }.less);
++    const loading_generation: ?u64 = if (images.loading) |l| (if (l.frame) |f| f.image_generation else null) else null;
++    if (images.loading) |l| if (l.frame) |*f| {
++        f.image_generation = 0;
++    };
++    for (ages) |img| {
++        const old = img.generation;
++        img.generation = storage.nextGeneration(s.io);
++        if (images.loading) |loading| if (loading.frame) |*frame| {
++            const target = frame.cmd.transmission;
++            if ((if (target.image_id != 0) target.image_id == img.id else target.image_number == img.number) and
++                loading_generation == old) frame.image_generation = img.generation;
++        };
++    }
++    // Expired pins can leave relative descendants without their parent.
++    images.pruneSnapshotOrphans(s);
++    var chains = images.placements.iterator();
++    while (chains.next()) |entry| {
++        var current = entry.key_ptr.*;
++        var depth: usize = 0;
++        while (images.placements.get(current)) |placement| {
++            switch (placement.location) {
++                .pin, .virtual => break,
++                .relative => |rel| current = rel.parent,
++            }
++            depth += 1;
++            if (depth > ImageStorage.parent_chain_limit) return error.InvalidGraphicsRecord;
++        }
++    }
++    images.markMutated(s.io);
++    s.kitty_images.deinit(alloc, s);
++    s.kitty_images = images;
++}

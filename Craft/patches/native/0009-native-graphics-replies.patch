@@ -1,0 +1,36 @@
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -534,6 +534,8 @@
+             .unknown => return,
+             .kitty => |*kitty_cmd| {
+                 if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
++                    // The daemon owns the reply; every view still applies image state.
++                    if (self.host_geometry_responses) return;
+                     var buf: [1024]u8 = undefined;
+                     var writer: std.Io.Writer = .fixed(&buf);
+                     try resp.encode(&writer);
+@@ -553,6 +555,7 @@
+                 }
+ 
+                 if (resp) |r| {
++                    if (self.host_geometry_responses) return;
+                     var buf: [terminal.apc.glyph.Response.max_wire_bytes]u8 = undefined;
+                     var writer: std.Io.Writer = .fixed(&buf);
+                     try r.formatWire(&writer);
+--- a/src/termio/Termio.zig
++++ b/src/termio/Termio.zig
+@@ -497,8 +497,12 @@
+     };
+ 
+     // Set the image limits
+-    self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
+-    self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
++    // Font/theme reloads must keep the daemon's graphics policy. Otherwise a
++    // native view can accept images or file effects the authoritative parser rejected.
++    self.terminal.setKittyGraphicsSizeLimit(self.alloc, if (self.host_ordered_grid)
++        32 * 1024 * 1024 else config.image_storage_limit);
++    self.terminal.setKittyGraphicsLoadingLimits(if (self.host_ordered_grid)
++        .direct else .allWithTempDir(global.tmpDirPath()));
+ }
+ 
+ /// Resize the terminal.
