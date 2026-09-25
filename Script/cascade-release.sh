@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Builds Craft's release artifacts from the pinned Ghostty revision:
+# Builds Cascade's release artifacts from the pinned Ghostty revision:
 #   build/release/GhosttyKit.xcframework.zip   the binary target of this package
-#   build/release/ghostty-vt-runtime.zip       the headless VT runtime craft-ptyd links
+#   build/release/ghostty-vt-runtime.zip       the headless VT runtime cascade-ptyd links
 # Apple Silicon macOS only. Needs Xcode with the Metal Toolchain component
 # (downloaded here when missing) and network access for Zig and Ghostty.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-LOCK="$ROOT/Craft/ghostty.lock.json"
+LOCK="$ROOT/Cascade/ghostty.lock.json"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD/release" "$BUILD/tools"
 
@@ -43,7 +43,7 @@ checkout() { # <dir>
 # 1. libghostty with the app-runtime patches -> XCFramework.
 SRC="$BUILD/native-source"; checkout "$SRC"
 zsh "$ROOT/Script/apply-patches.sh" "$SRC"
-for patch in "$ROOT"/Craft/patches/native/*.patch; do git -C "$SRC" apply "$patch"; done
+for patch in "$ROOT"/Cascade/patches/native/*.patch; do git -C "$SRC" apply "$patch"; done
 (cd "$SRC" && ZIG_LOCAL_CACHE_DIR="$BUILD/cache/native" zig build -Doptimize=ReleaseFast -Dapp-runtime=none \
   -Demit-exe=false -Demit-xcframework=false -Demit-macos-app=false -Demit-docs=false \
   -Dsentry=false -Dcustom-shaders=false -Dinspector=false -Dtarget=aarch64-macos)
@@ -72,15 +72,15 @@ rm -f "$BUILD/release/GhosttyKit.xcframework.zip"
 
 # 2. The headless VT runtime (libghostty-vt) with the snapshot patches only.
 VT="$BUILD/vt-source"; checkout "$VT"
-for patch in "$ROOT"/Craft/patches/vt/*.patch; do git -C "$VT" apply "$patch"; done
+for patch in "$ROOT"/Cascade/patches/vt/*.patch; do git -C "$VT" apply "$patch"; done
 RUNTIME="$BUILD/runtime"; rm -rf "$RUNTIME"
 (cd "$VT" && zig build -Demit-lib-vt -Demit-exe=false -Demit-macos-app=false -Demit-xcframework=false \
   -Doptimize=ReleaseFast --prefix "$RUNTIME" --cache-dir "$BUILD/cache/vt")
 [[ -f "$RUNTIME/lib/libghostty-vt.a" ]]
-echo "$REVISION" > "$RUNTIME/craft-ghostty-revision"
-cp "$ROOT/Craft/patches/vt/0003-terminal-query-validation.patch" "$RUNTIME/craft-ghostty-query-patch"
-cp "$ROOT/Craft/patches/vt/0007-glyph-snapshot.patch" "$RUNTIME/craft-ghostty-glyph-patch"
-cp "$ROOT/Craft/patches/vt/0008-graphics-snapshot.patch" "$RUNTIME/craft-ghostty-graphics-patch"
+echo "$REVISION" > "$RUNTIME/cascade-ghostty-revision"
+cp "$ROOT/Cascade/patches/vt/0003-terminal-query-validation.patch" "$RUNTIME/cascade-ghostty-query-patch"
+cp "$ROOT/Cascade/patches/vt/0007-glyph-snapshot.patch" "$RUNTIME/cascade-ghostty-glyph-patch"
+cp "$ROOT/Cascade/patches/vt/0008-graphics-snapshot.patch" "$RUNTIME/cascade-ghostty-graphics-patch"
 rm -f "$BUILD/release/ghostty-vt-runtime.zip"
 (cd "$BUILD" && ditto -c -k --keepParent runtime release/ghostty-vt-runtime.zip)
 

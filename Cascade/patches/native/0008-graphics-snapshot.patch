@@ -4,8 +4,8 @@
  
  /// The complete compatibility boundary for snapshot layout and behavior.
  /// Version 1 readers require this value to match exactly.
--pub const version: u16 = 2; // Craft extension, negotiated as craft-glyph-v2.
-+pub const version: u16 = 3; // Craft extension, negotiated as craft-glyph-v2.
+-pub const version: u16 = 2; // Cascade extension, negotiated as cascade-glyph-v2.
++pub const version: u16 = 3; // Cascade extension, negotiated as cascade-glyph-v2.
  
  /// Number of bytes in the fixed envelope: magic followed by version.
  pub const encoded_len = computeLen();
@@ -13,10 +13,10 @@
 +++ b/src/terminal/snapshot/record.zig
 @@ -55,6 +55,9 @@
  
-     /// Craft: validated glyph registrations in FIFO order.
+     /// Cascade: validated glyph registrations in FIFO order.
      glyphs = 8,
 +
-+    /// Craft: owned Kitty images and placements after full history.
++    /// Cascade: owned Kitty images and placements after full history.
 +    graphics = 9,
  };
  
@@ -62,7 +62,7 @@
              // All sequences are consumed: FINISH ends the snapshot, leaving
              // trailing transport bytes unread.
              if (state.pending == 0) {
-+                // Craft restores through FINISH before delivering post-cut output.
++                // Cascade restores through FINISH before delivering post-cut output.
 +                // Never install graphics into a replaced or reflowed screen.
 +                var graphics_screens = state.generations.iterator();
 +                while (graphics_screens.next()) |entry| {
@@ -113,7 +113,7 @@
      /// space. Unused images take priority.
      total_bytes: usize = 0,
 -    total_limit: usize = 320 * 1000 * 1000, // 320MB
-+    total_limit: usize = 32 * 1024 * 1024, // Craft per-screen image budget
++    total_limit: usize = 32 * 1024 * 1024, // Cascade per-screen image budget
  
      /// Identifies one exact pending image transmission. The generation is
      /// assigned by this storage when the pending image is inserted, so a
@@ -135,7 +135,7 @@
  
  /// Maximum size in bytes, taken from Kitty.
 -const max_size = 400 * 1024 * 1024; // 400MB
-+const max_size = 32 * 1024 * 1024; // Craft: match detached/native transfer budgets
++const max_size = 32 * 1024 * 1024; // Cascade: match detached/native transfer budgets
  
  /// An image that is still being loaded. The image should be initialized
  /// using init on the first chunk and then addData for each subsequent
@@ -146,14 +146,14 @@
  /// Protocol will work but cannot accept PNG images.
  pub var decode_png: ?DecodePngFn = png: {
 -    if (build_options.artifact == .lib) break :png null;
-+    // Craft ships Wuffs in both runtimes so detached PNGs decode identically.
++    // Cascade ships Wuffs in both runtimes so detached PNGs decode identically.
      break :png &decodePngWuffs;
  };
  
 --- /dev/null
 +++ b/src/terminal/snapshot/graphics.zig
 @@ -0,0 +1,332 @@
-+//! Craft v3. Graphics are restored as owned state after history, never as APC
++//! Cascade v3. Graphics are restored as owned state after history, never as APC
 +//! replay. Wire scalars have explicit widths, independent of C/Zig ABI layout.
 +const std = @import("std");
 +const Allocator = std.mem.Allocator;

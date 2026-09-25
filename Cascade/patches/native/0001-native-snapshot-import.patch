@@ -4,7 +4,7 @@
  GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
  GHOSTTY_API void ghostty_surface_write_buffer(ghostty_surface_t, const uint8_t*, uintptr_t);
  GHOSTTY_API void ghostty_surface_write_buffer_replay(ghostty_surface_t, const uint8_t*, uintptr_t);
-+// Craft: fresh surface, UI thread, matching pinned revision; restores the captured grid.
++// Cascade: fresh surface, UI thread, matching pinned revision; restores the captured grid.
 +GHOSTTY_API bool ghostty_surface_restore_snapshot(ghostty_surface_t, const uint8_t*, uintptr_t);
 +GHOSTTY_API bool ghostty_surface_enable_host_state_responses(ghostty_surface_t);
 +bool ghostty_surface_enable_host_identity_responses(ghostty_surface_t);
@@ -36,7 +36,7 @@
          surface.core_surface.io.processOutputSuppressingResponses(ptr[0..len]);
 +    }
 +
-+    /// Craft snapshot extension. Call on the UI thread on a fresh surface,
++    /// Cascade snapshot extension. Call on the UI thread on a fresh surface,
 +    /// before exposing it to input. An invalid payload returns
 +    /// false and preserves the original terminal. Revisions must match exactly.
 +    export fn ghostty_surface_restore_snapshot(
