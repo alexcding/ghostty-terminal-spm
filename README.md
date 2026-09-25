@@ -1,19 +1,20 @@
-# GhosttyTerminal for Craft
+# GhosttyTerminal for Cascade
 
-Craft's fork of [libghostty-spm](https://github.com/Lakr233/libghostty-spm) (MIT, by
-@Lakr233) pinned at release 1.6.20260922, with the patches Craft's native terminal
+Cascade's fork of [libghostty-spm](https://github.com/Lakr233/libghostty-spm) (MIT, by
+@Lakr233) pinned at release 1.6.20260922, with the patches Cascade's native terminal
 needs applied to the Swift wrapper (`Sources/`) and, at build time, to Ghostty itself
-(`Craft/patches/`). Ghostty is MIT licensed too (`LICENSE-ghostty`).
+(`Cascade/patches/`). Ghostty is MIT licensed too (`LICENSE-ghostty`).
 
 The binary target is prebuilt: `Package.swift` points at the `GhosttyKit.xcframework.zip`
 attached to the GitHub release matching the tag, so consumers need neither Zig nor the
 Metal Toolchain. Each release also carries `ghostty-vt-runtime.zip`, the headless
-libghostty-vt runtime that Craft's PTY helper links. Apple Silicon macOS only.
+libghostty-vt runtime that Cascade's PTY helper links. Apple Silicon macOS only.
 
-Releasing: push a `<ghostty version>-craft.<n>` tag, let
-`.github/workflows/release.yml` build and attach the artifacts, then point
-`Package.swift` at the new tag with the checksum the job prints, and commit.
-`Script/craft-release.sh` is the same build, runnable locally.
+Releasing: run the Release workflow (`.github/workflows/release.yml`) with a
+`<ghostty version>-cascade.<n>` tag. It builds the artifacts, points `Package.swift`
+at that build's XCFramework and checksum, commits, tags the commit and publishes the
+same zips, then checks the published binary against the tagged manifest.
+`Script/cascade-release.sh` is the same build, runnable locally.
 
 ---
 

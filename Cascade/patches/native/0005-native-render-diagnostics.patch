@@ -4,7 +4,7 @@
  GHOSTTY_API void ghostty_surface_process_exit(ghostty_surface_t, uint32_t, uint64_t);
  GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
  GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
-+// Craft: cumulative submitted render frames for this live surface, not display timestamps.
++// Cascade: cumulative submitted render frames for this live surface, not display timestamps.
 +GHOSTTY_API uint64_t ghostty_surface_submitted_frame_count(ghostty_surface_t);
  GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
  GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
@@ -30,7 +30,7 @@
          /// being modified, and also when it's being accessed in `drawFrame`.
          draw_mutex: std.Io.Mutex = .init,
 +
-+        /// Craft diagnostic: actual frame submissions, including native-thread
++        /// Cascade diagnostic: actual frame submissions, including native-thread
 +        /// draws. Atomic reads do not acquire render locks or schedule work.
 +        submitted_frame_count: std.atomic.Value(u64) = .init(0),
  

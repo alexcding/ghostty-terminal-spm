@@ -43,7 +43,7 @@
  /// The complete compatibility boundary for snapshot layout and behavior.
  /// Version 1 readers require this value to match exactly.
 -pub const version: u16 = 1;
-+pub const version: u16 = 2; // Craft extension, negotiated as craft-glyph-v2.
++pub const version: u16 = 2; // Cascade extension, negotiated as cascade-glyph-v2.
  
  /// Number of bytes in the fixed envelope: magic followed by version.
  pub const encoded_len = computeLen();
@@ -54,7 +54,7 @@
      /// Canonical unfinished standard TerminalStream input.
      continuation = 7,
 +
-+    /// Craft: validated glyph registrations in FIFO order.
++    /// Cascade: validated glyph registrations in FIFO order.
 +    glyphs = 8,
  };
  
@@ -106,7 +106,7 @@
 --- /dev/null
 +++ b/src/terminal/snapshot/glyphs.zig
 @@ -0,0 +1,76 @@
-+//! Craft snapshot v2: restore validated glyph registrations without replaying
++//! Cascade snapshot v2: restore validated glyph registrations without replaying
 +//! terminal output, moving the cursor, or generating protocol responses.
 +const std = @import("std");
 +const Allocator = std.mem.Allocator;
