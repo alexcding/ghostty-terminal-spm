@@ -1,7 +1,7 @@
 # GhosttyTerminal for Cascade
 
 Cascade's fork of [libghostty-spm](https://github.com/Lakr233/libghostty-spm) (MIT, by
-@Lakr233) pinned at release 1.6.20260922, with the patches Cascade's native terminal
+@Lakr233) pinned at release 2.2.2026103001, with the patches Cascade's native terminal
 needs applied to the Swift wrapper (`Sources/`) and, at build time, to Ghostty itself
 (`Cascade/patches/`). Ghostty is MIT licensed too (`LICENSE-ghostty`).
 

@@ -216,7 +216,7 @@
          .cell_width = self.size.cell.width,
          .cell_height = self.size.cell.height,
      };
-@@ -695,8 +731,188 @@
+@@ -695,8 +731,190 @@
      self.processOutputLocked(buf);
  }
  
@@ -250,6 +250,7 @@
 +    decoded.terminal.?.colors.background.default = self.terminal.colors.background.default;
 +    decoded.terminal.?.colors.foreground.default = self.terminal.colors.foreground.default;
 +    decoded.terminal.?.colors.cursor.default = self.terminal.colors.cursor.default;
++    decoded.terminal.?.setDefaultXtChecksum(self.terminal.default_xt_checksum);
 +    const snapshot_has_geometry = decoded.terminal.?.width_px != 0 and decoded.terminal.?.height_px != 0;
 +    if (!snapshot_has_geometry) {
 +        decoded.terminal.?.width_px = self.terminal.width_px;
@@ -290,6 +291,7 @@
 +        .renderer_wakeup = self.renderer_wakeup,
 +        .renderer_mailbox = self.renderer_mailbox,
 +        .enquiry_response = self.config.enquiry_response,
++        .xt_checksum_report = self.config.xt_checksum_report,
 +        .osc_color_report_format = self.config.osc_color_report_format,
 +        .clipboard_write = self.config.clipboard_write,
 +        .clipboard_write_limit = self.config.clipboard_write_limit,

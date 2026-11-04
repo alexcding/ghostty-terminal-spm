@@ -1,5 +1,5 @@
 name: Release
-# Dispatch with a tag like 1.6.20260922-cascade.2. The job builds the pinned
+# Dispatch with a tag like 2.2.2026103001-cascade.2. The job builds the pinned
 # Ghostty from source, points Package.swift at this build's XCFramework with its
 # checksum, commits, tags that commit and publishes the same artifacts. The build
 # is not byte-reproducible, so the manifest must come from the build it ships.
